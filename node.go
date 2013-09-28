@@ -1,8 +1,9 @@
 package ein
 
 import (
+	"bytes"
 	"fmt"
-    "bytes"
+	"io"
 )
 
 type nodeType int
@@ -36,7 +37,8 @@ var nodeNames = map[nodeType]string{
 type node interface {
 	Type() nodeType
 	Children() []node
-    String() string
+	String() string
+	Eval(io.Writer, *environment) error
 	parse(tokenReader) error
 }
 
@@ -64,7 +66,12 @@ func newPlaintextNode(text string) node {
 }
 
 func (n plaintextNode) String() string {
-    return fmt.Sprintf("[text: %q]", n.text)
+	return fmt.Sprintf("[text: %q]", n.text)
+}
+
+func (n plaintextNode) Eval(w io.Writer, env *environment) error {
+	_, err := io.WriteString(w, n.text)
+	return err
 }
 
 // identifier node holds an identifier name, to be retrieved from an
@@ -82,6 +89,15 @@ func newIdentifierNode(name string) node {
 
 func (n identifierNode) String() string {
 	return fmt.Sprintf("[ident: %q]", n.name)
+}
+
+func (n identifierNode) Eval(w io.Writer, env *environment) error {
+	v, ok := env.get(n.name)
+	if !ok {
+		return fmt.Errorf("no such name: %s", n.name)
+	}
+	_, err := fmt.Fprintf(w, "%v", v)
+	return err
 }
 
 type children []node
@@ -105,11 +121,20 @@ type listNode struct {
 }
 
 func (l listNode) String() string {
-    var buf bytes.Buffer
-    for _, n := range l.children {
-        buf.WriteString(n.String())
-    }
-    return fmt.Sprintf("[list (%t, %d, %q): [%s] %q]", l.root, len(l.children), l.terminators, buf.String())
+	var buf bytes.Buffer
+	for _, n := range l.children {
+		buf.WriteString(n.String())
+	}
+	return fmt.Sprintf("[list (%t, %d, %q): [%s] %q]", l.root, len(l.children), l.terminators, buf.String())
+}
+
+func (l *listNode) Eval(w io.Writer, env *environment) error {
+	for _, child := range l.children {
+		if err := child.Eval(w, env); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func newListNode(root bool, terminators ...string) *listNode {
@@ -155,15 +180,15 @@ func (n *listNode) parse(r tokenReader) error {
 
 func (n *listNode) atEnd(r tokenReader) bool {
 	for _, name := range n.terminators {
-        fn, ok := parsePredicates[name]
-        if !ok {
-            panic("invalid parsePredicate name: " + name)
-        }
+		fn, ok := parsePredicates[name]
+		if !ok {
+			panic("invalid parsePredicate name: " + name)
+		}
 		if fn(r) {
-            debugf("hit listNode end!\n")
+			debugf("hit listNode end!\n")
 			return true
 		}
-        debugf("listNode end terminator %v didn't pass...\n", name)
+		debugf("listNode end terminator %v didn't pass...\n", name)
 	}
 	return false
 }
@@ -180,7 +205,7 @@ func (n ifNode) Children() []node {
 }
 
 func (n ifNode) String() string {
-    return fmt.Sprintf("[if cond:%v true:%s false:%s]", n.cond, n.trueBranch, n.falseBranch)
+	return fmt.Sprintf("[if cond:%v true:%s false:%s]", n.cond, n.trueBranch, n.falseBranch)
 }
 
 func newIfNode(tokens []token) *ifNode {
@@ -194,19 +219,26 @@ func (n *ifNode) parse(r tokenReader) error {
 	}
 	switch {
 	case beforeEnd(r):
-        r.nextn(3)
+		r.nextn(3)
 		return nil
 	case beforeElse(r):
-        r.nextn(3)
+		r.nextn(3)
 		n.falseBranch = newListNode(false, "beforeEnd")
-        if err := n.falseBranch.parse(r); err != nil {
-            return err
-        }
-        r.nextn(3)
-        return nil
+		if err := n.falseBranch.parse(r); err != nil {
+			return err
+		}
+		r.nextn(3)
+		return nil
 	default:
 		panic("PUKE PUKE PUKE")
 	}
+}
+
+func (n *ifNode) Eval(w io.Writer, env *environment) error {
+	if n.trueBranch != nil {
+		return n.trueBranch.Eval(w, env)
+	}
+	return nil
 }
 
 type endNode struct {
@@ -223,6 +255,8 @@ func (n endNode) String() string {
 	return "[end]"
 }
 
+func (n endNode) Eval(w io.Writer, env *environment) error { return nil }
+
 type elseNode struct {
 	nodeType
 	childless
@@ -236,6 +270,8 @@ func (n elseNode) String() string {
 func newElseNode() *elseNode {
 	return &elseNode{nodeType: nodeElse}
 }
+
+func (n elseNode) Eval(w io.Writer, env *environment) error { return nil }
 
 func matchNodes(left, right node) bool {
 	if left.Type() != right.Type() {
